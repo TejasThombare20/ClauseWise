@@ -1,0 +1,217 @@
+# Contract Analysis System - Implementation Plan
+
+## Context
+
+Build a system that analyzes legal contract documents (DOCX) using a Claude AI agent with tool calling. Users place DOCX files in `server/public/`, the system parses them to Markdown using mammoth.js (`convertToMarkdown()`), sends the Markdown to a Claude agent, which extracts data for 9 predefined clause categories via forced tool calling, stores results in Postgres, and serves them via REST API to a React frontend.
+
+**Tech Stack**: React + Vite (client), Node.js + Express (server), postgres, Winston (logging), Claude API (@anthropic-ai/sdk), Zod (validation), mammoth.js (DOCX → Markdown)
+
+---
+
+## Document Parsing Approach
+
+**Chosen: Parse DOCX → Markdown with mammoth.js, then send Markdown to Claude.**
+
+- `mammoth.convertToMarkdown()` preserves headings, bold, italic, lists — giving the LLM better structural context for identifying clause boundaries
+- Free, pure JS, zero native dependencies, 500k+ weekly npm downloads
+- More token-efficient than sending base64-encoded PDFs
+- Claude API does NOT support DOCX natively (only PDF/images), so text extraction is required regardless
+
+**Alternatives considered & rejected:**
+- Raw text extraction (`extractRawText`) — loses structure
+- DOCX → PDF → Claude — requires LibreOffice/pandoc system dependency
+- Direct file upload to agent — not supported for DOCX format
+
+---
+
+## File Structure
+
+```
+decoverAI/
+├── README.md
+├── client/
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.js
+│   └── src/
+│       ├── main.jsx
+│       ├── App.jsx
+│       ├── App.css
+│       ├── api/
+│       │   └── contracts.js            # Axios wrappers for API calls
+│       └── components/
+│           ├── ContractList.jsx         # List of analyzed contracts
+│           ├── ContractDetail.jsx       # 9 key-value pairs for a contract
+│           └── DocumentSelector.jsx     # Browse & trigger analysis
+│
+├── server/
+│   ├── package.json
+│   ├── .env                            # ANTHROPIC_API_KEY, PORT, DB_PATH
+│   ├── data/                           # Postgres file (auto-created)
+│   ├── logs/                           # Winston log files (auto-created)
+│   ├── public/                         # DOCX contract files go here
+│   └── src/
+│       ├── index.js                    # Express entry point
+│       ├── config/
+│       │   └── logger.js               # Winston: console + file transports
+│       ├── db/
+│       │   └── database.js             # postgres setup + query helpers
+│       ├── routes/
+│       │   └── contracts.js            # REST API endpoints
+│       ├── services/
+│       │   ├── documentParser.js       # mammoth.js DOCX → Markdown
+│       │   └── agentService.js         # Claude agent + forced tool calling
+│       └── schemas/
+│           └── toolSchemas.js          # Zod schemas + JSON Schema conversion
+```
+
+---
+
+## Database Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS contract_analyses (
+  id            TEXT PRIMARY KEY,          -- UUID v4
+  contract_name TEXT NOT NULL,
+  key_name      TEXT NOT NULL,
+  content       TEXT NOT NULL,             -- Clause text or "NO_DATA_AVAILABLE"
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(contract_name, key_name)          -- Prevents duplicates on re-analysis
+);
+
+CREATE INDEX IF NOT EXISTS idx_contract_name ON contract_analyses(contract_name);
+```
+
+- `INSERT OR REPLACE` used so re-analyzing a contract updates existing rows
+- All 9 rows inserted atomically via `db.transaction()`
+
+---
+
+## API Endpoints
+
+| Method | Path                   | Description                                  |
+|--------|------------------------|----------------------------------------------|
+| GET    | /api/documents         | List available DOCX files in server/public/  |
+| POST   | /api/analyze           | Analyze a document `{ filePath: "..." }`     |
+| GET    | /api/contracts         | List all analyzed contract names              |
+| GET    | /api/contracts/:name   | Get all 9 keys for a specific contract       |
+
+---
+
+## Agent + Tool Calling Design
+
+### System Prompt
+Instructs Claude to act as a legal contract analyst. It must:
+- Read the provided contract Markdown
+- Derive a concise contract name from the document content
+- Identify content for each of the 9 clause categories
+- Call the `store_contract_analysis` tool exactly once with all 9 results
+- Use `"NO_DATA_AVAILABLE"` for any clause not found in the contract
+
+### Tool Definition: `store_contract_analysis`
+
+```
+Input Schema (Zod):
+  analyses: z.array(
+    z.object({
+      contract_name: z.string(),
+      key_name: z.enum([...9 keys]),
+      content: z.string()
+    })
+  ).length(9)
+```
+
+- Uses `zod-to-json-schema` to convert Zod schema → JSON Schema for Claude API `input_schema`
+- Same Zod schema validates the response — single source of truth
+
+### Forced Tool Use
+```js
+tool_choice: { type: "tool", name: "store_contract_analysis" }
+```
+This guarantees Claude calls the tool on the first turn — no agentic loop needed.
+
+### Model
+`claude-sonnet-4-20250514` — cost-efficient for structured extraction tasks.
+
+### 9 Contract Keys
+1. `intellectual_property_ownership`
+2. `limitation_of_liability`
+3. `warranty_disclaimer`
+4. `indemnification`
+5. `data_processing_terms`
+6. `termination_for_convenience`
+7. `non_solicitation`
+8. `payment_terms`
+9. `confidentiality`
+
+---
+
+## Winston Logging Configuration
+
+- **Console transport**: Colorized, `info` level (development)
+- **File transport (combined)**: `server/logs/app.log`, `info` level
+- **File transport (errors)**: `server/logs/error.log`, `error` level
+- **Format**: `timestamp | level | message`
+- All API calls logged with method, path, status code, response time
+- Agent service logs: contract name, token usage, tool call results
+
+---
+
+## Server Dependencies
+
+```
+express, cors, dotenv, mammoth, @anthropic-ai/sdk,
+pg, uuid, winston, zod, zod-to-json-schema
+```
+Dev: `nodemon`
+
+## Client Dependencies
+
+```
+react, react-dom, react-router-dom, axios
+```
+Dev: `vite, @vitejs/plugin-react`
+
+---
+
+## Implementation Steps (in order)
+
+### Phase 1: Server Foundation
+1. Initialize `server/package.json`, install all dependencies
+2. Create `.env` with `ANTHROPIC_API_KEY`, `PORT=3000`, `DB_PATH=./data/contracts.db`
+3. Create Winston logger (`server/src/config/logger.js`)
+4. Create postgres database setup + query helpers (`server/src/db/database.js`)
+
+### Phase 2: Core Services
+5. Create document parser — `mammoth.convertToMarkdown()` (`server/src/services/documentParser.js`)
+6. Create Zod schemas + JSON Schema conversion (`server/src/schemas/toolSchemas.js`)
+7. Create Claude agent service with forced tool calling (`server/src/services/agentService.js`)
+
+### Phase 3: API Layer
+8. Create Express routes — 4 endpoints (`server/src/routes/contracts.js`)
+9. Create Express app entry point — CORS, body parser, request logging middleware, error handler (`server/src/index.js`)
+
+### Phase 4: Client
+10. Scaffold React + Vite app in `client/`
+11. Configure Vite proxy (`/api` → `http://localhost:3000`)
+12. Create API helper functions with axios (`client/src/api/contracts.js`)
+13. Build React components:
+    - `DocumentSelector.jsx` — list files, trigger analysis
+    - `ContractList.jsx` — list analyzed contracts
+    - `ContractDetail.jsx` — show 9 key-value pairs
+
+### Phase 5: Finalize
+14. Place a sample DOCX contract in `server/public/` for testing
+15. Generate `README.md` at project root
+
+---
+
+## Verification
+
+1. Place a sample contract DOCX in `server/public/`
+2. Start server: `cd server && npm run dev`
+3. Start client: `cd client && npm run dev`
+4. Open UI → select document → click "Analyze"
+5. Verify: agent extracts 9 keys, data stored in DB, displayed in UI
+6. Check `server/logs/app.log` for Winston request logs
+7. Re-analyze same document — verify UNIQUE constraint updates (not duplicates)
