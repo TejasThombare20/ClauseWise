@@ -14,6 +14,9 @@ ClauseWise is a full-stack platform that uses Claude AI to automatically extract
 
 ---
 
+<img width="2532" height="1384" alt="image" src="https://github.com/user-attachments/assets/843fdaa3-55a0-43b2-aae6-94c87a4425b4" />
+
+
 ## File Structure
 
 ### Server (`server/`)
